@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"github.com/miownag/agent-local-bridge/internal/bridge"
-	"github.com/miownag/agent-local-bridge/internal/server"
+	"github.com/miownag/agent-local-bridge/server"
 	"log"
 	"net"
 	"net/http"

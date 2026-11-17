@@ -1,7 +1,7 @@
 package handler
 
 import (
-	"github.com/miownag/agent-local-bridge/internal/server"
+	"github.com/miownag/agent-local-bridge/server"
 	"net/http"
 	"sync"
 )
