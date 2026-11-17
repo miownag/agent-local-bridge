@@ -90,6 +90,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/bridge-worker-li
 | `UPSTASH_REDIS_REST_URL` | Redis REST HTTPS URL |
 | `UPSTASH_REDIS_REST_TOKEN` | 具备读写能力的 Redis REST token |
 
+通过 Vercel Marketplace 连接 Upstash 时，也支持自动注入的 `KV_REST_API_URL` 和 `KV_REST_API_TOKEN`，无需复制或重命名。显式配置的 `UPSTASH_REDIS_REST_*` 优先，不能混用两组中的 URL 和 token。
+
 可以将 `cmd/setup` 生成的两个随机值分别复制到 Vercel 环境变量。不要把 `.env` 提交到仓库。Vercel 上不要设置 `BRIDGE_DEV`。Preview 和 Production 应使用不同的 namespace、凭证和 origin。
 
 正式 MCP endpoint、OAuth metadata 和 worker API 必须能从公网访问。如果启用了 Vercel Deployment Protection，需要为目标部署配置适当的访问方式，否则 Anthropic 和 worker 会被 Vercel 登录页拦截。应用自己的 OAuth 和 worker 鉴权必须保留。

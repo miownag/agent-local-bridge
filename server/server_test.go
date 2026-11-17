@@ -338,3 +338,26 @@ func TestConfigFailsClosed(t *testing.T) {
 		t.Fatal("Vercel accepted in-memory storage")
 	}
 }
+
+func TestMarketplaceRedisEnvironment(t *testing.T) {
+	t.Setenv("VERCEL", "1")
+	t.Setenv("BRIDGE_PUBLIC_URL", "https://bridge.example")
+	t.Setenv("BRIDGE_ADMIN_SECRET", strings.Repeat("a", 40))
+	t.Setenv("BRIDGE_WORKER_TOKEN", strings.Repeat("w", 40))
+	t.Setenv("BRIDGE_NAMESPACE", "marketplace-test")
+	t.Setenv("UPSTASH_REDIS_REST_URL", "")
+	t.Setenv("UPSTASH_REDIS_REST_TOKEN", "")
+	t.Setenv("KV_REST_API_URL", "https://redis.example")
+	t.Setenv("KV_REST_API_TOKEN", "marketplace-token")
+	app, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := app.store.(*store.Redis); !ok {
+		t.Fatal("Marketplace Redis was not selected")
+	}
+	t.Setenv("UPSTASH_REDIS_REST_URL", "https://explicit.example")
+	if _, err = FromEnv(); err == nil {
+		t.Fatal("partially configured explicit credentials were mixed with Marketplace credentials")
+	}
+}

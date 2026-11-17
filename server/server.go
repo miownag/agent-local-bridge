@@ -40,9 +40,13 @@ type App struct {
 func FromEnv() (*App, error) {
 	c := Config{PublicURL: os.Getenv("BRIDGE_PUBLIC_URL"), AdminSecret: os.Getenv("BRIDGE_ADMIN_SECRET"), WorkerSecret: os.Getenv("BRIDGE_WORKER_TOKEN"), AllowLocal: os.Getenv("BRIDGE_DEV") == "1" && os.Getenv("VERCEL") == ""}
 	var s store.Store
-	if endpoint := os.Getenv("UPSTASH_REDIS_REST_URL"); endpoint != "" {
+	endpoint, token := os.Getenv("UPSTASH_REDIS_REST_URL"), os.Getenv("UPSTASH_REDIS_REST_TOKEN")
+	if endpoint == "" && token == "" {
+		endpoint, token = os.Getenv("KV_REST_API_URL"), os.Getenv("KV_REST_API_TOKEN")
+	}
+	if endpoint != "" {
 		var err error
-		s, err = store.NewRedis(endpoint, os.Getenv("UPSTASH_REDIS_REST_TOKEN"), os.Getenv("BRIDGE_NAMESPACE"))
+		s, err = store.NewRedis(endpoint, token, os.Getenv("BRIDGE_NAMESPACE"))
 		if err != nil {
 			return nil, err
 		}
