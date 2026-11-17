@@ -87,6 +87,7 @@ func (f *fixture) form(t *testing.T, path string, b url.Values, cookies []*http.
 		t.Fatal(e)
 	}
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("Origin", f.url)
 	for _, c := range cookies {
 		r.AddCookie(c)
 	}
@@ -139,6 +140,12 @@ func (f *fixture) authCode(t *testing.T) (string, string, string) {
 	q := url.Values{"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {redirect}, "code_challenge_method": {"S256"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "state": {"expected-state"}, "resource": {f.url + "/mcp"}}
 	r, b = f.request(t, "GET", "/oauth/authorize?"+q.Encode(), nil, "")
 	check(t, r, 200, b)
+	if r.Header.Get("Referrer-Policy") != "same-origin" {
+		t.Fatal("browser form policy must preserve same-origin POST Origin")
+	}
+	if !strings.Contains(r.Header.Get("Content-Security-Policy"), "https://claude.ai/api/mcp/auth_callback") {
+		t.Fatal("browser form policy blocks the Claude OAuth redirect")
+	}
 	cookies := r.Cookies()
 	csrf := field(t, b, "csrf")
 	consent := field(t, b, "consent")
@@ -359,5 +366,24 @@ func TestMarketplaceRedisEnvironment(t *testing.T) {
 	t.Setenv("UPSTASH_REDIS_REST_URL", "https://explicit.example")
 	if _, err = FromEnv(); err == nil {
 		t.Fatal("partially configured explicit credentials were mixed with Marketplace credentials")
+	}
+}
+
+func TestUntrustedBrowserOriginsRemainBlocked(t *testing.T) {
+	f := newFixture(t)
+	for _, origin := range []string{"null", "https://attacker.example"} {
+		r, err := http.NewRequest("POST", f.url+"/oauth/approve", strings.NewReader(""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Origin", origin)
+		res, err := f.client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != 403 {
+			t.Fatalf("untrusted Origin %q returned %d", origin, res.StatusCode)
+		}
 	}
 }

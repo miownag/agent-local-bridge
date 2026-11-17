@@ -155,8 +155,13 @@ func body(w http.ResponseWriter, r *http.Request, v any) bool {
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+	// Keep same-origin form POSTs attributable while withholding cross-origin referrers.
+	w.Header().Set("Referrer-Policy", "same-origin")
+	formTargets := "'self' https://claude.ai/api/mcp/auth_callback"
+	if a.cfg.AllowLocal {
+		formTargets += " http://localhost:* http://127.0.0.1:* http://[::1]:*"
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action "+formTargets+"; frame-ancestors 'none'; base-uri 'none'")
 	// Vercel terminates TLS. All absolute links come from the configured origin.
 	if origin := r.Header.Get("Origin"); origin != "" && origin != a.cfg.PublicURL {
 		failure(w, 403, "origin_not_allowed")
