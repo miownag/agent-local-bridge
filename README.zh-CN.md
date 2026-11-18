@@ -10,6 +10,8 @@ Agent Local Bridge 为云端聊天助手接入本地工具，让它在同一段�
 
 > “看看这个仓库，修复失败的测试，跑一遍验证，再告诉我改了什么。”
 
+**需要自行部署：** 每位用户自行部署桥接服务端和 Redis 数据库，再将自己的本地 worker 和 Claude 连接到该部署。本仓库提供程序和部署说明，不提供共享托管服务。下文所有 `https://your-project.vercel.app` 均为占位示例，请替换成你自己的 Vercel 部署地址或自定义域名。
+
 ## 一、能做什么
 
 - **按需读取。** 文件按页返回，限制输出长度，超长单行也能按字节继续读取。
@@ -116,7 +118,7 @@ chmod 600 .env.worker
 ### 3.4 连接 Claude Desktop Chat
 
 1. 在 Claude Desktop 打开 **Settings → Customize → Connectors**，添加远程自定义连接器。
-2. 名称可填写 **Agent Local Bridge**，URL 填写 `https://your-project.vercel.app/mcp`。
+2. 名称可填写 **Agent Local Bridge**，URL 填写**你自己部署的服务地址**并加上 `/mcp`，替换占位示例 `https://your-project.vercel.app/mcp`。
 3. 在浏览器中使用 **`BRIDGE_ADMIN_SECRET`** 完成授权。`bridge:coding` 权限允许通过 worker 进行本地文件操作和执行 Bash。
 4. 返回 Claude，开启 Chat 对话，在该对话的工具菜单中启用连接器。
 

@@ -10,6 +10,8 @@ Agent Local Bridge gives a cloud-hosted chat assistant tools to work on your com
 
 > “Inspect this repository, fix the failing test, run the tests, and show me what changed.”
 
+**Self-hosted:** each user deploys their own bridge server and Redis database, then connects their local worker and Claude to that deployment. This repository provides the software and deployment instructions; it does not provide a shared hosted service. Every `https://your-project.vercel.app` URL below is a placeholder for your own Vercel deployment URL or custom domain.
+
 ## What it does
 
 - **Read without flooding the conversation.** Files are returned in bounded pages, including byte-based continuation for very long lines.
@@ -116,7 +118,7 @@ Replace the project path with an existing directory. The dashboard should show t
 ### 4. Connect Claude Desktop Chat
 
 1. Open **Settings → Customize → Connectors** in Claude Desktop. Add a custom remote connector.
-2. Use a name such as **Agent Local Bridge** and the URL `https://your-project.vercel.app/mcp`.
+2. Use a name such as **Agent Local Bridge**. Enter **your own deployed server URL** followed by `/mcp`, replacing the placeholder `https://your-project.vercel.app/mcp`.
 3. Complete the browser authorization using your **`BRIDGE_ADMIN_SECRET`**. The `bridge:coding` scope grants local file operations and Bash access through the worker.
 4. Return to Claude, start a Chat conversation, and enable the connector in that conversation's tools menu.
 
