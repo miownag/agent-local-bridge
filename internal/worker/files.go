@@ -1,13 +1,19 @@
 package worker
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -15,187 +21,447 @@ import (
 	"github.com/miownag/agent-local-bridge/internal/bridge"
 )
 
+const outputBytes = 12 * 1024
+const editBytes = 8 * 1024 * 1024
+
 type Files struct {
-	root *os.Root
-	Name string
+	Name     string
+	cwd      string
+	mu       sync.Mutex
+	sessions map[string]*shellSession
+	closed   bool
 }
 
 func OpenFiles(dir string) (*Files, error) {
-	absolute, e := filepath.Abs(dir)
+	if dir == "" {
+		dir = "."
+	}
+	p, e := filepath.Abs(dir)
 	if e != nil {
 		return nil, e
 	}
-	absolute, e = filepath.EvalSymlinks(absolute)
-	if e != nil {
-		return nil, errors.New("test directory must already exist")
+	s, e := os.Stat(p)
+	if e != nil || !s.IsDir() {
+		return nil, errors.New("working directory must exist")
 	}
-	if absolute == string(filepath.Separator) {
-		return nil, errors.New("filesystem root cannot be used as a test directory")
+	name := filepath.Base(p)
+	if name == string(filepath.Separator) {
+		name = "filesystem"
 	}
-	home, _ := os.UserHomeDir()
-	if resolved, err := filepath.EvalSymlinks(home); err == nil {
-		home = resolved
-	}
-	if absolute == home {
-		return nil, errors.New("home directory cannot be used as a test directory")
-	}
-	r, e := os.OpenRoot(absolute)
-	if e != nil {
-		return nil, errors.New("cannot open test directory; create it before starting the worker")
-	}
-	return &Files{root: r, Name: filepath.Base(absolute)}, nil
+	return &Files{Name: name, cwd: p, sessions: make(map[string]*shellSession)}, nil
 }
-func (f *Files) Close() error { return f.root.Close() }
-func (f *Files) valid(path string, newFile bool) error {
-	if len(path) > 1024 || !utf8.ValidString(path) || !filepath.IsLocal(path) || strings.ContainsAny(path, "\\\x00") {
-		return errors.New("path must be relative to the test directory")
+func (f *Files) Close() error {
+	f.mu.Lock()
+	f.closed = true
+	sessions := make([]*shellSession, 0, len(f.sessions))
+	for _, s := range f.sessions {
+		sessions = append(sessions, s)
 	}
-	if path == "." {
-		if newFile {
-			return errors.New("a file path is required")
-		}
-		return nil
+	f.mu.Unlock()
+	for _, s := range sessions {
+		s.stop()
 	}
-	parts := strings.Split(path, "/")
-	current := ""
-	for i, part := range parts {
-		if part == "" || part == "." || part == ".." || strings.HasPrefix(part, ".") {
-			return errors.New("hidden paths and traversal are not allowed")
-		}
-		current = filepath.Join(current, part)
-		s, e := f.root.Lstat(current)
-		if e != nil {
-			if newFile && i == len(parts)-1 && os.IsNotExist(e) {
-				return nil
-			}
-			return errors.New("path does not exist or is inaccessible")
-		}
-		if s.Mode()&os.ModeSymlink != 0 {
-			return errors.New("symbolic links are not allowed")
-		}
-		if i < len(parts)-1 && !s.IsDir() {
-			return errors.New("parent path is not a directory")
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for _, s := range sessions {
+		select {
+		case <-s.done:
+		case <-timer.C:
+			return errors.New("bash process cleanup timed out")
 		}
 	}
 	return nil
 }
+func (f *Files) resolve(p string) (string, error) {
+	if len(p) > 4096 || !utf8.ValidString(p) || strings.ContainsRune(p, 0) {
+		return "", errors.New("invalid path")
+	}
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		h, e := os.UserHomeDir()
+		if e != nil {
+			return "", e
+		}
+		if p == "~" {
+			p = h
+		} else {
+			p = filepath.Join(h, p[2:])
+		}
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(f.cwd, p)
+	}
+	return filepath.Clean(p), nil
+}
+func clip(s string, n int) string {
+	s = strings.ToValidUTF8(s, "�")
+	if len(s) <= n {
+		return s
+	}
+	s = s[:n]
+	for !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
+}
 func (f *Files) Execute(job bridge.Job) bridge.Result {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Unix(job.Deadline, 0))
+	defer cancel()
+	return f.ExecuteContext(ctx, job)
+}
+func (f *Files) ExecuteContext(ctx context.Context, job bridge.Job) bridge.Result {
 	r := bridge.Result{ID: job.ID, Receipt: job.Receipt}
-	if job.Deadline <= time.Now().Unix() {
+	if ctx.Err() != nil || job.Deadline <= time.Now().Unix() {
 		r.Error = "job expired before execution"
 		return r
 	}
 	var out any
 	var e error
+	a := job.Arguments
 	switch job.Tool {
 	case "list_files":
-		out, e = f.list(job.Arguments.Path)
+		out, e = f.list(a)
 	case "read_file":
-		out, e = f.read(job.Arguments.Path)
+		out, e = f.read(ctx, a)
 	case "write_file":
-		out, e = f.write(job.Arguments.Path, job.Arguments.Content)
+		out, e = f.write(a)
+	case "edit_file":
+		out, e = f.edit(a)
+	case "glob", "grep":
+		out, e = f.search(ctx, job.Tool, a)
+	case "bash":
+		out, e = f.bash(a)
+	case "bash_list":
+		out, e = f.listShells()
+	case "bash_poll":
+		out, e = f.pollShell(a, false)
+	case "bash_kill":
+		out, e = f.pollShell(a, true)
 	default:
 		e = errors.New("unsupported tool")
 	}
 	if e != nil {
-		r.Error = e.Error()
+		r.Error = clip(e.Error(), 160)
 	} else {
 		r.Output, _ = json.Marshal(out)
 		if len(r.Output) > 96*1024 {
 			r.Output = nil
-			r.Error = "encoded result exceeds the 96 KiB response limit"
+			r.Error = "encoded result exceeds response limit"
 		}
 	}
 	return r
 }
-
-type Entry struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+func openRegular(p string) (*os.File, os.FileInfo, error) {
+	d, e := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if e != nil {
+		return nil, nil, e
+	}
+	s, e := d.Stat()
+	if e != nil || !s.Mode().IsRegular() {
+		d.Close()
+		return nil, nil, errors.New("only regular files are supported")
+	}
+	return d, s, nil
 }
-
-func (f *Files) list(path string) (any, error) {
-	if e := f.valid(path, false); e != nil {
+func digest(b []byte) string { v := sha256.Sum256(b); return hex.EncodeToString(v[:]) }
+func (f *Files) read(ctx context.Context, a bridge.Arguments) (any, error) {
+	if a.Offset < 0 || a.Limit < 0 || a.Limit > 2000 || a.ByteOffset < 0 || (a.ByteOffset > 0 && a.Offset > 1) {
+		return nil, errors.New("invalid range: use offset (1-based) or byte_offset, limit 1..2000")
+	}
+	p, e := f.resolve(a.Path)
+	if e != nil {
 		return nil, e
 	}
-	d, e := f.root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	d, s, e := openRegular(p)
 	if e != nil {
-		return nil, errors.New("cannot open directory")
+		return nil, e
+	}
+	defer d.Close()
+	if a.ByteOffset > s.Size() {
+		return nil, errors.New("byte_offset exceeds file size")
+	}
+	start := a.ByteOffset
+	line := max(a.Offset, 1)
+	limit := a.Limit
+	if limit == 0 {
+		limit = 200
+	}
+	if start > 0 {
+		_, e = d.Seek(start, io.SeekStart)
+		if e != nil {
+			return nil, e
+		}
+	} else if line > 1 {
+		br := bufio.NewReaderSize(d, 64*1024)
+		for n := 1; n < line; {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			b, err := br.ReadSlice('\n')
+			start += int64(len(b))
+			if start > 64*1024*1024 {
+				return nil, errors.New("line scan exceeds 64 MiB; use byte_offset")
+			}
+			if len(b) > 0 && b[len(b)-1] == '\n' {
+				n++
+			}
+			if err != nil && err != bufio.ErrBufferFull {
+				if err == io.EOF {
+					break
+				}
+				return nil, err
+			}
+		}
+		_, e = d.Seek(start, io.SeekStart)
+		if e != nil {
+			return nil, e
+		}
+	}
+	b, e := io.ReadAll(io.LimitReader(d, outputBytes+4))
+	if e != nil {
+		return nil, e
+	}
+	end := min(len(b), outputBytes)
+	count := 0
+	for i := 0; i < end; i++ {
+		if b[i] == '\n' {
+			count++
+			if count == limit {
+				end = i + 1
+				break
+			}
+		}
+	}
+	if len(b) > end {
+		floor := max(0, end-3)
+		for end > floor && !utf8.Valid(b[:end]) {
+			end--
+		}
+	}
+	b = b[:end]
+	if !utf8.Valid(b) || bytes.IndexByte(b, 0) >= 0 {
+		return nil, errors.New("binary or invalid UTF-8 file; use bash for binary inspection")
+	}
+	out := map[string]any{"path": p, "content": string(b), "size_bytes": s.Size(), "byte_offset": start, "next_byte_offset": start + int64(end), "truncated": start+int64(end) < s.Size()}
+	if a.ByteOffset == 0 {
+		out["start_line"] = line
+		out["next_line"] = line + bytes.Count(b, []byte{'\n'})
+		out["ends_mid_line"] = end > 0 && b[end-1] != '\n' && start+int64(end) < s.Size()
+	}
+	// Hash only editable files, streaming into a fixed-size buffer.
+	if s.Size() <= editBytes {
+		if _, e = d.Seek(0, io.SeekStart); e != nil {
+			return nil, e
+		}
+		h := sha256.New()
+		if _, e = io.Copy(h, io.LimitReader(d, editBytes+1)); e != nil {
+			return nil, e
+		}
+		out["sha256"] = hex.EncodeToString(h.Sum(nil))
+	}
+	current, err := d.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if current.Size() != s.Size() || !current.ModTime().Equal(s.ModTime()) {
+		return nil, errors.New("file changed while reading; retry the read")
+	}
+	return out, nil
+}
+func (f *Files) list(a bridge.Arguments) (any, error) {
+	if a.Offset < 0 || a.Limit < 0 || a.Limit > 1000 {
+		return nil, errors.New("offset must be nonnegative, limit at most 1000")
+	}
+	p, e := f.resolve(a.Path)
+	if e != nil {
+		return nil, e
+	}
+	d, e := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if e != nil {
+		return nil, e
 	}
 	defer d.Close()
 	s, e := d.Stat()
 	if e != nil || !s.IsDir() {
 		return nil, errors.New("path is not a directory")
 	}
-	entries, e := d.Readdir(201)
+	limit := a.Limit
+	if limit == 0 {
+		limit = 200
+	}
+	// Directory offsets follow filesystem order to avoid loading enormous directories.
+	skip := a.Offset
+	for skip > 0 {
+		batch, e := d.ReadDir(min(skip, 256))
+		skip -= len(batch)
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			return nil, e
+		}
+	}
+	entries, e := d.ReadDir(limit + 1)
 	if e != nil && e != io.EOF {
-		return nil, errors.New("cannot list directory")
-	}
-	truncated := len(entries) > 200
-	if truncated {
-		entries = entries[:200]
-	}
-	out := []Entry{}
-	for _, v := range entries {
-		if strings.HasPrefix(v.Name(), ".") {
-			continue
-		}
-		kind := "unsupported"
-		if v.Mode().IsRegular() {
-			kind = "file"
-		} else if v.IsDir() {
-			kind = "directory"
-		} else if v.Mode()&os.ModeSymlink != 0 {
-			kind = "symlink_blocked"
-		}
-		out = append(out, Entry{v.Name(), kind})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return map[string]any{"entries": out, "truncated": truncated}, nil
-}
-func (f *Files) read(path string) (any, error) {
-	if e := f.valid(path, false); e != nil {
 		return nil, e
 	}
-	d, e := f.root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	more := len(entries) > limit
+	if more {
+		entries = entries[:limit]
+	}
+	out := []map[string]string{}
+	used := 0
+	for _, v := range entries {
+		if used+len(v.Name())+64 > outputBytes {
+			more = true
+			break
+		}
+		kind := "file"
+		if v.IsDir() {
+			kind = "directory"
+		} else if v.Type()&os.ModeSymlink != 0 {
+			kind = "symlink"
+		} else if v.Type() != 0 {
+			kind = "special"
+		}
+		out = append(out, map[string]string{"name": v.Name(), "type": kind})
+		encoded, _ := json.Marshal(out[len(out)-1])
+		used += len(encoded)
+	}
+	return map[string]any{"path": p, "entries": out, "next_offset": a.Offset + len(out), "truncated": more}, nil
+}
+func editable(p string) ([]byte, os.FileInfo, error) {
+	d, s, e := openRegular(p)
 	if e != nil {
-		return nil, errors.New("cannot read file")
+		return nil, nil, e
 	}
 	defer d.Close()
-	s, e := d.Stat()
-	if e != nil || !s.Mode().IsRegular() {
-		return nil, errors.New("only regular files can be read")
+	if s.Size() > editBytes {
+		return nil, nil, errors.New("editing limited to 8 MiB files; use bash for larger files")
 	}
-	b, e := io.ReadAll(io.LimitReader(d, bridge.MaxFileBytes+1))
+	b, e := io.ReadAll(io.LimitReader(d, editBytes+1))
 	if e != nil {
-		return nil, errors.New("cannot read file")
+		return nil, nil, e
 	}
-	if len(b) > bridge.MaxFileBytes {
-		return nil, errors.New("file exceeds 64 KiB limit")
+	if len(b) > editBytes || !utf8.Valid(b) || bytes.IndexByte(b, 0) >= 0 {
+		return nil, nil, errors.New("edit requires UTF-8 text up to 8 MiB")
 	}
-	if !utf8.Valid(b) {
-		return nil, errors.New("file must contain UTF-8 text")
-	}
-	return map[string]any{"path": path, "content": string(b)}, nil
+	return b, s, nil
 }
-func (f *Files) write(path, content string) (any, error) {
-	if len(content) > bridge.MaxFileBytes || !utf8.ValidString(content) {
-		return nil, errors.New("content must be UTF-8 text of at most 64 KiB")
+func (f *Files) write(a bridge.Arguments) (any, error) {
+	if len(a.Content) > bridge.MaxFileBytes || !utf8.ValidString(a.Content) || strings.ContainsRune(a.Content, 0) {
+		return nil, errors.New("content must be UTF-8 text up to 64 KiB")
 	}
-	if e := f.valid(path, true); e != nil {
+	p, e := f.resolve(a.Path)
+	if e != nil {
 		return nil, e
 	}
-	d, e := f.root.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if e != nil {
-		return nil, errors.New("cannot create file; existing files cannot be overwritten")
+	if a.CreateParents {
+		if e = os.MkdirAll(filepath.Dir(p), 0755); e != nil {
+			return nil, e
+		}
 	}
-	_, e = d.WriteString(content)
+	if !a.Overwrite {
+		d, e := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if e != nil {
+			return nil, e
+		}
+		_, e = d.WriteString(a.Content)
+		if e == nil {
+			e = d.Sync()
+		}
+		ce := d.Close()
+		if e != nil {
+			return nil, e
+		}
+		if ce != nil {
+			return nil, ce
+		}
+	} else {
+		if a.ExpectedSHA256 == "" {
+			return nil, errors.New("overwrite requires expected_sha256 from read_file")
+		}
+		old, s, e := editable(p)
+		if e != nil {
+			return nil, e
+		}
+		if digest(old) != a.ExpectedSHA256 {
+			return nil, errors.New("file changed; read it again before writing")
+		}
+		if e = atomicReplace(p, old, []byte(a.Content), s.Mode()); e != nil {
+			return nil, e
+		}
+	}
+	return map[string]any{"path": p, "bytes": len(a.Content), "sha256": digest([]byte(a.Content)), "created": !a.Overwrite}, nil
+}
+func atomicReplace(p string, old, next []byte, mode os.FileMode) error {
+	// Resolve existing links so atomic replacement updates the target, not the symlink.
+	target, e := filepath.EvalSymlinks(p)
+	if e != nil {
+		return e
+	}
+	d, e := os.CreateTemp(filepath.Dir(target), ".bridge-edit-*")
+	if e != nil {
+		return e
+	}
+	defer os.Remove(d.Name())
+	if e = d.Chmod(mode.Perm()); e == nil {
+		_, e = d.Write(next)
+	}
 	if e == nil {
 		e = d.Sync()
 	}
-	closeErr := d.Close()
-	if e != nil || closeErr != nil {
-		return nil, errors.New("write failed; inspect the file before retrying")
+	ce := d.Close()
+	if e != nil {
+		return e
 	}
-	return map[string]any{"path": path, "bytes": len(content), "created": true}, nil
+	if ce != nil {
+		return ce
+	}
+	now, _, e := editable(target)
+	if e != nil {
+		return e
+	}
+	if !bytes.Equal(now, old) {
+		return errors.New("file changed during editing; read it again")
+	}
+	return os.Rename(d.Name(), target)
+}
+func (f *Files) edit(a bridge.Arguments) (any, error) {
+	if a.OldText == "" {
+		return nil, errors.New("old_text must be nonempty; use write_file for new files")
+	}
+	if len(a.OldText)+len(a.NewText) > bridge.MaxFileBytes || !utf8.ValidString(a.NewText) {
+		return nil, errors.New("edit text exceeds 64 KiB or is not UTF-8")
+	}
+	p, e := f.resolve(a.Path)
+	if e != nil {
+		return nil, e
+	}
+	old, s, e := editable(p)
+	if e != nil {
+		return nil, e
+	}
+	if a.ExpectedSHA256 != "" && digest(old) != a.ExpectedSHA256 {
+		return nil, errors.New("file changed; read it again before editing")
+	}
+	count := strings.Count(string(old), a.OldText)
+	if count == 0 {
+		return nil, errors.New("old_text not found; match whitespace and line endings exactly")
+	}
+	if count > 1 && !a.ReplaceAll {
+		return nil, fmt.Errorf("old_text matches %d times; include more context or set replace_all", count)
+	}
+	if int64(len(old))+int64(count)*int64(len(a.NewText)-len(a.OldText)) > editBytes {
+		return nil, errors.New("edited file would exceed 8 MiB")
+	}
+	next := []byte(strings.ReplaceAll(string(old), a.OldText, a.NewText))
+	if bytes.IndexByte(next, 0) >= 0 {
+		return nil, errors.New("edit requires text without NUL bytes")
+	}
+	if e = atomicReplace(p, old, next, s.Mode()); e != nil {
+		return nil, e
+	}
+	idx := bytes.Index(old, []byte(a.OldText))
+	line := bytes.Count(old[:idx], []byte{'\n'}) + 1
+	return map[string]any{"path": p, "replacements": count, "first_changed_line": line, "sha256": digest(next), "bytes": len(next), "preview": clip("- "+a.OldText+"\n+ "+a.NewText, 4096), "preview_truncated": len(a.OldText)+len(a.NewText)+5 > 4096}, nil
 }

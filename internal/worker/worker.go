@@ -111,7 +111,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		if time.Since(lastHeartbeat) > 10*time.Second {
-			status, e := w.request(ctx, "/worker/heartbeat", bridge.Heartbeat{RootName: w.files.Name}, nil)
+			status, e := w.request(ctx, "/worker/heartbeat", bridge.Heartbeat{RootName: w.files.Name, Protocol: bridge.ProtocolVersion}, nil)
 			if e != nil {
 				if status == 401 || status == 403 {
 					return errors.New("worker credential rejected or bridge paused")
@@ -149,7 +149,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		if job.ID == "" || job.Receipt == "" || len(job.ID) > 64 || len(job.Receipt) > 64 || job.Deadline > time.Now().Add(90*time.Second).Unix() {
 			return errors.New("invalid task envelope")
 		}
-		result := w.files.Execute(job)
+		jobCtx, cancel := context.WithDeadline(ctx, time.Unix(job.Deadline, 0))
+		result := w.files.ExecuteContext(jobCtx, job)
+		cancel()
 		w.cfg.Logger.Info("task executed", "tool", job.Tool, "success", result.Error == "")
 		// Retry delivery of the same result, never execute a claimed task twice.
 		for time.Now().Unix() < job.Deadline && ctx.Err() == nil {

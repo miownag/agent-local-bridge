@@ -273,6 +273,32 @@ func TestMCPWorkerAcrossInstances(t *testing.T) {
 	if string(data) != "from-cloud" {
 		t.Fatal("existing file was changed")
 	}
+	b = call("edit_file", map[string]any{"path": "created.txt", "old_text": "from-cloud", "new_text": "edited-cloud"})
+	if strings.Contains(string(b), `"isError":true`) {
+		t.Fatal(string(b))
+	}
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	_ = os.WriteFile(outside, []byte("absolute-access"), 0600)
+	b = call("read_file", map[string]any{"path": outside})
+	if !strings.Contains(string(b), "absolute-access") {
+		t.Fatal(string(b))
+	}
+	b = call("bash", map[string]any{"command": "printf shell-ok > shell.txt; cat shell.txt", "yield_ms": 100})
+	if !strings.Contains(string(b), "shell-ok") || strings.Contains(string(b), `"isError":true`) {
+		t.Fatal(string(b))
+	}
+	b = call("read_file", map[string]any{"path": "shell.txt"})
+	if !strings.Contains(string(b), "shell-ok") {
+		t.Fatal(string(b))
+	}
+	b = call("bash_list", map[string]any{})
+	if !strings.Contains(string(b), "session_id") {
+		t.Fatal(string(b))
+	}
+	b = call("edit_file", map[string]any{"path": "created.txt", "old_text": "edited-cloud"})
+	if !strings.Contains(string(b), `"isError":true`) {
+		t.Fatal("missing required new_text accepted")
+	}
 }
 func TestWorkerAuthAndClaimOnce(t *testing.T) {
 	f := newFixture(t)
@@ -307,7 +333,7 @@ func TestOfflineTimeoutAndRevokeAll(t *testing.T) {
 		t.Fatal(e)
 	}
 	f.app.cfg.JobTimeout = 100 * time.Millisecond
-	_ = f.app.save(context.Background(), "heartbeat", bridge.Heartbeat{RootName: "test", At: time.Now().Unix()}, time.Minute)
+	_ = f.app.save(context.Background(), "heartbeat", bridge.Heartbeat{RootName: "test", At: time.Now().Unix(), Protocol: bridge.ProtocolVersion}, time.Minute)
 	_, e = f.app.dispatch(context.Background(), "read_file", bridge.Arguments{Path: "x"})
 	if e == nil || !strings.Contains(e.Error(), "timed out") {
 		t.Fatal(e)
@@ -385,5 +411,43 @@ func TestUntrustedBrowserOriginsRemainBlocked(t *testing.T) {
 		if res.StatusCode != 403 {
 			t.Fatalf("untrusted Origin %q returned %d", origin, res.StatusCode)
 		}
+	}
+}
+
+func TestRestrictedGrantsCannotUpgrade(t *testing.T) {
+	f := newFixture(t)
+	access, refresh, id := f.tokens(t)
+	var grant accessGrant
+	if e := f.app.load(context.Background(), "access:"+hash(access), &grant); e != nil {
+		t.Fatal(e)
+	}
+	grant.Scope = "bridge:files"
+	for _, key := range []string{"access:" + hash(access), "refresh:" + hash(refresh)} {
+		if e := f.app.save(context.Background(), key, grant, time.Hour); e != nil {
+			t.Fatal(e)
+		}
+	}
+	r, b := f.request(t, "POST", "/mcp", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, access)
+	check(t, r, 401, b)
+	r, b = f.form(t, "/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {id}}, nil)
+	check(t, r, 400, b)
+	id, code, verifier := f.authCode(t)
+	var auth authorization
+	if e := f.app.load(context.Background(), "code:"+hash(code), &auth); e != nil {
+		t.Fatal(e)
+	}
+	auth.Scope = ""
+	if e := f.app.save(context.Background(), "code:"+hash(code), auth, time.Minute); e != nil {
+		t.Fatal(e)
+	}
+	r, b = f.form(t, "/oauth/token", url.Values{"grant_type": {"authorization_code"}, "client_id": {id}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:9876/callback"}}, nil)
+	check(t, r, 400, b)
+}
+func TestOldWorkerRejected(t *testing.T) {
+	f := newFixture(t)
+	_ = f.app.save(context.Background(), "heartbeat", bridge.Heartbeat{RootName: "old", At: time.Now().Unix()}, time.Minute)
+	_, e := f.app.dispatch(context.Background(), "bash", bridge.Arguments{Command: "true"})
+	if e == nil || !strings.Contains(e.Error(), "upgrade") {
+		t.Fatalf("old worker accepted: %v", e)
 	}
 }

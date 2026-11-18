@@ -77,19 +77,13 @@ func New(c Config, s store.Store) (*App, error) {
 	}
 	c.PublicURL = strings.TrimRight(c.PublicURL, "/")
 	a := &App{cfg: c, store: s, mux: http.NewServeMux()}
-	ms := mcp.NewServer(&mcp.Implementation{Name: "agent-local-bridge", Version: "0.1.0"}, nil)
-	closed, nonDestructive := false, false
-	mcp.AddTool(ms, &mcp.Tool{Name: "bridge_status", Description: "Check whether the local test-directory worker is online.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closed}}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, bridge.Status, error) {
+	ms := mcp.NewServer(&mcp.Implementation{Name: "agent-local-bridge", Version: "0.2.0"}, nil)
+	closed := false
+	mcp.AddTool(ms, &mcp.Tool{Name: "bridge_status", Description: "Check local worker availability and protocol version.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closed}}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, bridge.Status, error) {
 		v, e := a.status(ctx)
 		return nil, v, e
 	})
-	for _, name := range []string{"list_files", "read_file", "write_file"} {
-		description := map[string]string{"list_files": "List entries in a relative test-directory path. Use . for the root.", "read_file": "Read a UTF-8 file inside the selected test directory, up to 64 KiB.", "write_file": "Create a new UTF-8 file inside the test directory, up to 64 KiB. Never overwrites existing files."}[name]
-		mcp.AddTool(ms, &mcp.Tool{Name: name, Description: description, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: name != "write_file", DestructiveHint: &nonDestructive, OpenWorldHint: &closed}}, func(ctx context.Context, _ *mcp.CallToolRequest, args bridge.Arguments) (*mcp.CallToolResult, any, error) {
-			out, e := a.dispatch(ctx, name, args)
-			return nil, out, e
-		})
-	}
+	a.addWorkerTools(ms)
 	a.mcp = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return ms }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: bridge.MaxBodyBytes})
 	a.routes()
 	return a, nil
@@ -243,7 +237,7 @@ func (a *App) status(ctx context.Context) (bridge.Status, error) {
 	if e = json.Unmarshal([]byte(s), &b); e != nil {
 		return bridge.Status{}, e
 	}
-	return bridge.Status{Online: time.Now().Unix()-b.At < 30, RootName: b.RootName}, nil
+	return bridge.Status{Online: time.Now().Unix()-b.At < 30, RootName: b.RootName, Protocol: b.Protocol}, nil
 }
 func (a *App) poll(w http.ResponseWriter, r *http.Request) {
 	if !a.workerAuth(w, r) {
@@ -304,7 +298,7 @@ func (a *App) result(w http.ResponseWriter, r *http.Request) {
 	reply(w, 200, map[string]bool{"ok": true})
 }
 func (a *App) dispatch(ctx context.Context, tool string, args bridge.Arguments) (any, error) {
-	if len(args.Path) > 1024 || len(args.Content) > bridge.MaxFileBytes {
+	if len(encode(args)) > 96*1024 || len(args.Path) > 4096 || len(args.Content) > bridge.MaxFileBytes {
 		return nil, errors.New("input exceeds size limit")
 	}
 	s, e := a.status(ctx)
@@ -313,6 +307,9 @@ func (a *App) dispatch(ctx context.Context, tool string, args bridge.Arguments) 
 	}
 	if !s.Online {
 		return nil, errors.New("worker offline or paused")
+	}
+	if s.Protocol != bridge.ProtocolVersion {
+		return nil, errors.New("worker upgrade required: start a protocol v2 coding worker")
 	}
 	j := bridge.Job{ID: random(), Tool: tool, Arguments: args, Receipt: random(), Deadline: time.Now().Add(a.cfg.JobTimeout).Unix()}
 	ok, e := a.store.SetNX(ctx, "slot", j.ID, a.cfg.JobTimeout+5*time.Second)
@@ -348,7 +345,7 @@ func (a *App) dispatch(ctx context.Context, tool string, args bridge.Arguments) 
 			return nil, errors.New("request cancelled; a claimed operation may already have completed")
 		case <-timer.C:
 			a.event(context.WithoutCancel(ctx), j, "timeout")
-			return nil, errors.New("worker timed out; check the test directory before retrying a write")
+			return nil, errors.New("worker timed out; inspect files and bash sessions before retrying")
 		case <-tick.C:
 			raw, err := a.store.Get(ctx, "result:"+j.ID)
 			if err != nil {

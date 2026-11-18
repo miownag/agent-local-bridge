@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const oauthScope = "bridge:files"
+const oauthScope = "bridge:coding"
 const grantTTL = 8 * 24 * time.Hour
 
 type oauthClient struct {
@@ -22,6 +22,7 @@ type oauthClient struct {
 	SecretHash string   `json:"secret_hash,omitempty"`
 }
 type authorization struct {
+	Scope     string
 	ClientID  string
 	Redirect  string
 	Challenge string
@@ -180,12 +181,12 @@ func (a *App) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	csrf := a.csrf(w, r)
 	id := random()
-	p := authorization{ClientID: c.ID, Redirect: q.Get("redirect_uri"), Challenge: q.Get("code_challenge"), State: q.Get("state"), CSRFHash: hash(csrf)}
+	p := authorization{Scope: oauthScope, ClientID: c.ID, Redirect: q.Get("redirect_uri"), Challenge: q.Get("code_challenge"), State: q.Get("state"), CSRFHash: hash(csrf)}
 	if a.save(r.Context(), "consent:"+hash(id), p, 5*time.Minute) != nil {
 		failure(w, 503, "storage_unavailable")
 		return
 	}
-	a.page(w, "授权 Claude 访问测试目录", map[string]any{"Consent": id, "CSRF": csrf, "Client": c.Name, "Authorize": true})
+	a.page(w, "授权 Claude 访问本地电脑", map[string]any{"Consent": id, "CSRF": csrf, "Client": c.Name, "Authorize": true})
 }
 func (a *App) approve(w http.ResponseWriter, r *http.Request) {
 	if !parseForm(w, r) || !a.limit(w, r, "owner-login", 10, time.Minute) {
@@ -201,7 +202,7 @@ func (a *App) approve(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PostForm.Get("consent")
 	var p authorization
-	if a.load(r.Context(), "consent:"+hash(id), &p) != nil || !equal(p.CSRFHash, hash(r.PostForm.Get("csrf"))) {
+	if a.load(r.Context(), "consent:"+hash(id), &p) != nil || p.Scope != oauthScope || !equal(p.CSRFHash, hash(r.PostForm.Get("csrf"))) {
 		failure(w, 400, "expired_consent")
 		return
 	}
@@ -267,7 +268,7 @@ func (a *App) token(w http.ResponseWriter, r *http.Request) {
 	case "authorization_code":
 		consumeKey = "code:" + hash(r.PostForm.Get("code"))
 		var p authorization
-		if a.load(r.Context(), consumeKey, &p) != nil || p.ClientID != c.ID || p.Redirect != r.PostForm.Get("redirect_uri") {
+		if a.load(r.Context(), consumeKey, &p) != nil || p.Scope != oauthScope || p.ClientID != c.ID || p.Redirect != r.PostForm.Get("redirect_uri") {
 			failure(w, 400, "invalid_grant")
 			return
 		}
